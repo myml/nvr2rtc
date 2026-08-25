@@ -1,0 +1,7 @@
+# 编译产物与缓存
+nvr2rtc
+.gocache/
+.gopath/
+
+# 日志
+*.log
