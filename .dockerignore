@@ -1,0 +1,6 @@
+# 构建上下文排除: 本地编译产物、缓存、VCS、日志
+.git
+.gocache
+.gopath
+nvr2rtc
+*.log
