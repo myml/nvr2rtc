@@ -123,7 +123,9 @@ func (c *tsCleaner) rebuildPMT(sec []byte) []byte {
 		return nil
 	}
 	body := sec[:len(sec)-4] // 去掉 CRC
-	pos := 12 + int((body[10]&0x0f)<<8|body[11])
+	// program_info_length 的高 4 位在 body[10] 低半字节、低 8 位在 body[11]；
+	// 必须先转 int 再移位（byte<<8 在 Go 中恒为 0，见同文件 learnPAT 的写法）
+	pos := 12 + (int(body[10]&0x0f)<<8 | int(body[11]))
 	var kept []byte
 	newPID := -1
 	for pos+5 <= len(body) {
@@ -156,11 +158,11 @@ func (c *tsCleaner) rebuildPMT(sec []byte) []byte {
 // rewritePMTPkt: 用干净 PMT section 重写一个 PMT 包: 保留 TS 头, 载荷=指针字段+新 section+0xFF 填充
 func rewritePMTPkt(pkt []byte, newSection []byte) []byte {
 	p := make([]byte, 188)
-	copy(p, pkt[:4])              // TS 头
-	p[1] |= 0x40                  // payload_unit_start_indicator
-	p[3] = pkt[3]&0xf0 | 0x01     // 纯载荷, 无 adaptation field
-	p[4] = 0                      // pointer_field
-	copy(p[5:], newSection)       // 新 PMT section
+	copy(p, pkt[:4])          // TS 头
+	p[1] |= 0x40              // payload_unit_start_indicator
+	p[3] = pkt[3]&0xf0 | 0x01 // 纯载荷, 无 adaptation field
+	p[4] = 0                  // pointer_field
+	copy(p[5:], newSection)   // 新 PMT section
 	for j := 5 + len(newSection); j < 188; j++ {
 		p[j] = 0xFF // 填充
 	}

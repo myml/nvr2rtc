@@ -285,7 +285,8 @@ program=1  pcr_pid=0x44
 - **没有原生 FTP/NAS 备份**：`backup_storage`/`backup_service` 在 1.0.22 和 1.0.25 都不存在；
   固件里的 `ftp_upload/ftp_download` 字符串是 nvrtest 自测项；`ConfLocalStorageBackup.htm`
   是共享遗留页面。**NAS 自动备份只能靠外部工具拉录像**（本仓库 nvrdl 就是干这个的）；
-- 通道编号：API `channel = 物理通道-1`（0=第1路…本机 0,2,3,5 = 物理 1/3/4/6 路）；
+- 通道编号：API `channel = 物理通道-1`（0=第1路…本机 0,2,3,5 = 物理 1/3/4/6 路）。
+  **本仓库 HTTP 端点 `/ch/<N>` 用物理通道号（1 起），提前做了 `N-1` 换算**（见 main.go）；
 - 单条流速率 = 实时码率（HEVC 2K 约 2~2.5Mbps）；8 路并发是协议给的上限；
 - ffmpeg/VLC 打开本工具的 HTTP-TS 流很慢是 **ffmpeg 默认 probesize=5MB** 的探测行为，
   与 NVR 协议无关；加 `-probesize 32768 -analyzeduration 100000` 即秒开（见 nvrdl/README.md）。

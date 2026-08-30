@@ -7,7 +7,8 @@
 //
 // 默认连接 192.168.0.49:8000，监听 0.0.0.0:8081，允许全部 8 路通道。
 //
-// 端点: http://<host>:8081/ch/<N>    (N = API 通道号, 0 起)
+// 端点: http://<host>:8081/ch/<N>    (N = 通道号, 1 起, 与 TP-Link 客户端一致;
+// NVR 协议内部通道为 N-1, 见 tplink 包)
 package main
 
 import (
@@ -28,7 +29,7 @@ func main() {
 		user   = flag.String("user", envOr("NVR2RTC_USER", "admin"), "NVR 管理员用户名")
 		pass   = flag.String("pass", envOr("NVR2RTC_PASS", ""), "NVR 管理员密码")
 		httpAd = flag.String("http", envOr("NVR2RTC_HTTP", "0.0.0.0:8081"), "HTTP 监听地址")
-		allow  = flag.String("ch", "", "通道白名单(逗号分隔, 如 0,2,3); 默认不限制(任意 0..N 通道, N 取决于 NVR 路数)")
+		allow  = flag.String("ch", "", "通道白名单(逗号分隔, 1 起, 如 1,3,4,6); 默认不限制(任意 1..N 通道, N 取决于 NVR 路数)")
 		clean  = flag.Bool("clean", false, "清洗 TS：剔除 TP-Link 私有流(0x92)，只保留视频流；默认透传原始流")
 	)
 	flag.Parse()
@@ -44,7 +45,8 @@ func main() {
 		addr += ":8000" // 默认流端口
 	}
 
-	// 通道白名单: 空 = 不限制; 指定 = 仅放行列出的通道(其余 403)
+	// 通道白名单: 空 = 不限制; 指定 = 仅放行列出的通道(其余 403)。
+	// 通道号 1 起(对应 TP-Link 客户端的第 1/N 路)。
 	var allowed map[int]bool
 	if *allow != "" {
 		allowed = map[int]bool{}
@@ -54,8 +56,8 @@ func main() {
 				continue
 			}
 			n, err := strconv.Atoi(p)
-			if err != nil || n < 0 {
-				fmt.Fprintf(os.Stderr, "无效通道号: %q (应为非负整数)\n", p)
+			if err != nil || n < 1 {
+				fmt.Fprintf(os.Stderr, "无效通道号: %q (应为正整数, 1 起)\n", p)
 				os.Exit(1)
 			}
 			allowed[n] = true
@@ -72,8 +74,8 @@ func main() {
 		}
 		chS := strings.TrimPrefix(r.URL.Path, "/ch/")
 		ch, err := strconv.Atoi(chS)
-		if err != nil || ch < 0 {
-			http.Error(w, "bad channel: /ch/<非负整数>", 400)
+		if err != nil || ch < 1 {
+			http.Error(w, "bad channel: /ch/<正整数, 1 起>", 400)
 			return
 		}
 		if allowed != nil && !allowed[ch] {
@@ -87,12 +89,25 @@ func main() {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush() // 立即发出响应头; 不等第一个 body 字节(无效通道/等待重连时客户端也能立即看到 200)
 		}
-		stream := client.Stream(ch, *clean)
+		// 用户面通道 1 起; NVR 协议通道 = ch-1
+		stream := client.Stream(ch-1, *clean)
 		defer stream.Close()
 		buf := make([]byte, 1<<16)
-		if _, err := copyTo(w, stream, buf); err != nil {
-			return // 客户端断开, 正常
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			copyTo(w, stream, buf)
+		}()
+		select {
+		case <-done: // copyTo 因写失败/EOF 自行结束
+		case <-r.Context().Done():
+			// 客户端断开: 无数据流(空通道)时 copyTo 会一直阻塞在读上、
+			// 永远不会因写失败发现断开 —— 显式取消订阅并等拷贝协程退出,
+			// 避免空通道的 NVR 会话被永久占住(订阅泄漏)
+			stream.Close()
+			<-done
 		}
+		return
 	})
 
 	chList := "全部"
