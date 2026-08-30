@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"strings"
@@ -32,7 +33,7 @@ const (
 
 	// hubIdleGrace: 最后一个订阅者离开后，NVR 会话再保留的时长；
 	// 期间有新的订阅者到达则直接复用，否则关闭会话回到待命。
-	hubIdleGrace = 10 * time.Second
+	hubIdleGrace = 60 * time.Second
 	// subBufBytes: 每个订阅者下行缓冲上限（字节）。慢客户端溢出时丢最旧，
 	// 只影响自己，不拖累其他订阅者。
 	subBufBytes = 256 << 10
@@ -267,8 +268,10 @@ func (h *hub) run() {
 			time.Sleep(2 * time.Second)
 			continue
 		}
+		log.Printf("tplink: [API 通道 %d] NVR 预览会话已建立 (clean=%v)\n", h.ch, h.clean)
 		h.consume(cn)
 		cn.conn.Close()
+		log.Printf("tplink: [API 通道 %d] NVR 预览会话已关闭\n", h.ch)
 		time.Sleep(2 * time.Second)
 	}
 }

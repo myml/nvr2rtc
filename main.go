@@ -91,6 +91,9 @@ func main() {
 		}
 		// 用户面通道 1 起; NVR 协议通道 = ch-1
 		stream := client.Stream(ch-1, *clean)
+		clientAddr := r.RemoteAddr
+		log.Printf("[/ch/%d] 客户端 %s 连入\n", ch, clientAddr)
+		defer log.Printf("[/ch/%d] 客户端 %s 断开\n", ch, clientAddr)
 		defer stream.Close()
 		buf := make([]byte, 1<<16)
 		done := make(chan struct{})
