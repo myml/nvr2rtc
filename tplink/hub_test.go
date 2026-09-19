@@ -3,6 +3,7 @@ package tplink
 import (
 	"bytes"
 	"io"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -224,6 +225,68 @@ func TestHubFeedRaw(t *testing.T) {
 	}
 	if !bytes.Equal(buf[:n], stream) {
 		t.Fatal("raw hub feed must pass through the exact original bytes")
+	}
+}
+
+// ---- 码流档位 ----
+
+// TestResWireValues: 线上值是 NVR 固件子串匹配用的字符串，固定为 HD/VGA；
+// String() 返回语义名 main/sub（避免日志里出现易误读的 "VGA"）。
+func TestResWireValues(t *testing.T) {
+	if ResMain != "HD" {
+		t.Fatalf("主码流线上值应为 HD, got %q", ResMain)
+	}
+	if ResSub != "VGA" {
+		t.Fatalf("子码流线上值应为 VGA, got %q", ResSub)
+	}
+	if ResMain.String() != "main" || ResSub.String() != "sub" {
+		t.Fatalf("String() 应返回 main/sub, got %q/%q", ResMain, ResSub)
+	}
+}
+
+// TestHubKeyDistinguishesRes: 同一通道的不同档位必须是各自独立的 hub key，
+// 否则主/子码流会互相串流（子码流订阅者拿到高清流）。
+func TestHubKeyDistinguishesRes(t *testing.T) {
+	mainKey := hubKey{ch: 0, res: ResMain, clean: false}
+	subKey := hubKey{ch: 0, res: ResSub, clean: false}
+	if mainKey == subKey {
+		t.Fatal("不同档位必须映射到不同 hub key")
+	}
+	// 档位相同、清洗形态不同也必须区分（原有行为）
+	if mainKey == (hubKey{ch: 0, res: ResMain, clean: true}) {
+		t.Fatal("clean 形态必须参与 hub key")
+	}
+	// 通道不同必须区分
+	if mainKey == (hubKey{ch: 1, res: ResMain, clean: false}) {
+		t.Fatal("通道号必须参与 hub key")
+	}
+}
+
+// TestBuildPreviewResolutions: preview 请求体必须带上档位对应的 resolutions，
+// 且空档位回落主码流(HD)；extra 可覆盖。
+func TestBuildPreviewResolutions(t *testing.T) {
+	get := func(res []string, extra map[string]any) map[string]any {
+		return buildPreview(3, res, extra)
+	}
+	// 默认(空) → HD 主码流
+	if got := get(nil, nil)["resolutions"]; !reflect.DeepEqual(got, []string{"HD"}) {
+		t.Fatalf("空档位应回落 HD, got %v", got)
+	}
+	// 子码流 → VGA
+	if got := get([]string{string(ResSub)}, nil)["resolutions"]; !reflect.DeepEqual(got, []string{"VGA"}) {
+		t.Fatalf("子码流应发 VGA, got %v", got)
+	}
+	// 通道号正确落到 channels
+	if got := get(nil, nil)["channels"]; !reflect.DeepEqual(got, []int{3}) {
+		t.Fatalf("channels 应为 [3], got %v", got)
+	}
+	// 固定字段 pri 认证存在
+	if got := get(nil, nil)["privary_auth"]; !reflect.DeepEqual(got, []int{0}) {
+		t.Fatalf("privary_auth 应为 [0], got %v", got)
+	}
+	// extra 覆盖 resolutions
+	if got := get(nil, map[string]any{"resolutions": []string{"SVGA"}})["resolutions"]; !reflect.DeepEqual(got, []string{"SVGA"}) {
+		t.Fatalf("extra 应覆盖 resolutions, got %v", got)
 	}
 }
 

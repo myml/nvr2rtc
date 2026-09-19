@@ -5,6 +5,8 @@
 //   - 两步 POST /stream 握手（Content-Length: -1，需原生 TCP）
 //   - multipart/mixed JSON 信封 + 信用流控（X-Data-Window-Size / stream_sequence）
 //   - 响应 multipart 解析（video/mp2t part + JSON part），TS 清洗（见 tsclean.go）
+//   - 码流档位：ResMain("HD")=主码流（高清 HEVC 2560×1440），
+//     ResSub("VGA")=子码流（低清 H.264 640×480）；线上值经固件子串匹配，见 Res 注释
 //   - 每通道共享会话扇出：同通道多个订阅者只占一路 NVR 会话，各自独立下行缓冲
 //
 // 协议细节见仓库根 PROTOCOL.md。
@@ -119,8 +121,26 @@ type nvrConn struct {
 	br   *bufio.Reader
 }
 
-// dialStream: 与 NVR 建立 preview 会话并发送消息（App 同款）。
-func (c *Client) dialStream(ch int) (*nvrConn, error) {
+// buildPreview: 组装 preview 请求的 JSON 对象。res 为空默认 HD（主码流/高清）。
+// extra 中的键值会覆盖/追加，便于探测低清（子码流）参数。
+func buildPreview(ch int, res []string, extra map[string]any) map[string]any {
+	if len(res) == 0 {
+		res = []string{string(ResMain)}
+	}
+	p := map[string]any{
+		"channels":     []int{ch},
+		"privary_auth": []int{0},
+		"resolutions":  res,
+	}
+	for k, v := range extra {
+		p[k] = v
+	}
+	return p
+}
+
+// dialStreamPreview: 与 NVR 建立 preview 会话并发送消息（App 同款）。
+// res 为空时默认主码流（HD）；extra 为附加/覆盖的请求字段。
+func (c *Client) dialStreamPreview(ch int, res []string, extra map[string]any) (*nvrConn, error) {
 	conn, err := c.dialer.Dial("tcp", c.Addr)
 	if err != nil {
 		return nil, err
@@ -145,11 +165,7 @@ func (c *Client) dialStream(ch int) (*nvrConn, error) {
 	// POST #2: 认证 + body（请求 + 预发信用确认，无闭合分隔符）
 	reqJSON, _ := json.Marshal(map[string]any{
 		"type": "request", "seq": 0,
-		"params": map[string]any{"method": "get", "preview": map[string]any{
-			"channels":     []int{ch},
-			"privary_auth": []int{0},
-			"resolutions":  []string{"HD"},
-		}},
+		"params": map[string]any{"method": "get", "preview": buildPreview(ch, res, extra)},
 	})
 	var body bytes.Buffer
 	body.WriteString("----" + streamBoundary + "--\r\n")
@@ -188,20 +204,48 @@ func (c *Client) dialStream(ch int) (*nvrConn, error) {
 	return &nvrConn{conn: conn, br: br}, nil
 }
 
+// Res: 预览码流档位（对外语义只有"主/子"两档）。
+//
+// 注意其值是与 NVR 通信的线上字符串，而 NVR 固件对 `resolutions` 只做**子串匹配**：
+//   - 含 "HD"  → 主码流（HEVC 2560×1440）
+//   - 含 "VGA" → 子码流（H.264 640×480）
+//   - 两者都不含（如 "SD"/"LD"/"1080P"）→ 返回 200 但零字节的静默空流
+//
+// 所以 "VGA" 这个名字是**误导性的**：它与 "QVGA"/"SVGA" 等价，都指向同一路
+// 640×480 子码流，并不能选到更低分辨率（SPS 逐字节相同，已实测）。仅这两个
+// 线上取值稳定可用，故只暴露这两档。
+type Res string
+
+const (
+	ResMain Res = "HD"  // 线上值 "HD" → 主码流（高清）
+	ResSub  Res = "VGA" // 线上值 "VGA" → 子码流（低清 640×480）
+)
+
+// String: 日志用语义名（main/sub），而不是容易误读的线上值。
+func (r Res) String() string {
+	if r == ResSub {
+		return "sub"
+	}
+	return "main"
+}
+
 // Stream: 订阅 NVR API 通道 ch 的实时预览流（读失败内部自动重连）。
 // 注意 ch 是 NVR 协议通道号（0 起）；HTTP 端点的用户通道号（1 起）已在 main.go 换算。
-// 同一 (通道, clean) 的多个订阅者共享一路 NVR 会话：上游只拉一次，
+// 同一 (通道, 档位, clean) 的多个订阅者共享一路 NVR 会话：上游只拉一次，
 // 清洗（如果需要）在 hub 侧只做一遍，再扇出给所有订阅者（各自独立下行缓冲，
 // 满则丢最旧，只影响自己）。
 // clean=true 时 hub 统一做 TS 清洗（剔除 TP-Link 私有流，只留视频流），
 // 所有订阅者拿到同一份清洗后的流；clean=false 原样透传 NVR 原始流。
 // 返回的 io.ReadCloser 由调用方负责 Close。
-func (c *Client) Stream(ch int, clean bool) io.ReadCloser {
-	key := hubKey{ch: ch, clean: clean}
+func (c *Client) Stream(ch int, res Res, clean bool) io.ReadCloser {
+	if res == "" {
+		res = ResMain
+	}
+	key := hubKey{ch: ch, res: res, clean: clean}
 	c.mu.Lock()
 	h := c.hubs[key]
 	if h == nil {
-		h = &hub{ch: ch, clean: clean, c: c, subs: map[*sub]struct{}{}, wake: make(chan struct{}, 1)}
+		h = &hub{ch: ch, res: res, clean: clean, c: c, subs: map[*sub]struct{}{}, wake: make(chan struct{}, 1)}
 		if clean {
 			h.cleaner = newTSCleaner()
 		}
@@ -212,20 +256,22 @@ func (c *Client) Stream(ch int, clean bool) io.ReadCloser {
 	return h.subscribe()
 }
 
-// hubKey: 通道与会话形态（清洗与否）一起作为共享上游的键：需要原始流的
-// 订阅者和需要清洗流的订阅者各自一条上游，互不干扰。
+// hubKey: 通道、码流档位与会话形态（清洗与否）一起作为共享上游的键：
+// 不同档位/不同清洗形态的订阅者各自一条上游，互不干扰。
 type hubKey struct {
 	ch    int
+	res   Res
 	clean bool
 }
 
-// hub: 一个 (通道, 清洗形态) 的共享上游。多个 HTTP 客户端订阅同一 key 时，
+// hub: 一个 (通道, 档位, 清洗形态) 的共享上游。多个 HTTP 客户端订阅同一 key 时，
 // 只维持一路 NVR preview 会话，hub 把流扇出给所有订阅者；hub 与上游循环
 // 常驻进程生命周期，无订阅者时待命（不占 NVR 会话）。
 // clean 形态下清洗在 hub 做一遍（cleaner 常驻，学习到的 PID 跨会话保留），
 // 订阅者拿到的是同一份已清洗的流。
 type hub struct {
 	ch      int
+	res     Res
 	clean   bool
 	cleaner *tsCleaner // clean 时非空：feed 前先清洗一次
 	c       *Client
@@ -263,15 +309,15 @@ func (h *hub) run() {
 			<-h.wake // 待命；可能消费到陈旧唤醒，回到循环再核对一次
 			continue
 		}
-		cn, err := h.c.dialStream(h.ch)
+		cn, err := h.c.dialStreamPreview(h.ch, []string{string(h.res)}, nil)
 		if err != nil {
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		log.Printf("tplink: [API 通道 %d] NVR 预览会话已建立 (clean=%v)\n", h.ch, h.clean)
+		log.Printf("tplink: [API 通道 %d] NVR 预览会话已建立 (档位=%s clean=%v)\n", h.ch, h.res, h.clean)
 		h.consume(cn)
 		cn.conn.Close()
-		log.Printf("tplink: [API 通道 %d] NVR 预览会话已关闭\n", h.ch)
+		log.Printf("tplink: [API 通道 %d] NVR 预览会话已关闭 (档位=%s)\n", h.ch, h.res)
 		time.Sleep(2 * time.Second)
 	}
 }

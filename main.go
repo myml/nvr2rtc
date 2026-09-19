@@ -7,8 +7,12 @@
 //
 // 默认连接 192.168.0.49:8000，监听 0.0.0.0:8081，允许全部 8 路通道。
 //
-// 端点: http://<host>:8081/ch/<N>    (N = 通道号, 1 起, 与 TP-Link 客户端一致;
-// NVR 协议内部通道为 N-1, 见 tplink 包)
+// 端点: http://<host>:8081/ch/<N>     (主码流/高清, N = 通道号, 1 起)
+//
+//	http://<host>:8081/sub/<N>    (子码流/低清 640×480)
+//
+// 路径即档位, 不接受查询参数覆盖。
+// NVR 协议内部通道为 N-1, 见 tplink 包。
 package main
 
 import (
@@ -66,58 +70,65 @@ func main() {
 
 	client := tplink.New(addr, *user, *pass)
 
+	// streamHandler: 拉流端点。前缀即档位：/ch/ = 主码流(HD)，/sub/ = 子码流(低清)。
+	// 不接受 ?res= 覆盖 —— 路径即档位，接口面最小。
+	streamHandler := func(res tplink.Res, prefix string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != "GET" {
+				http.Error(w, "GET only", 405)
+				return
+			}
+			chS := strings.TrimPrefix(r.URL.Path, prefix)
+			ch, err := strconv.Atoi(chS)
+			if err != nil || ch < 1 {
+				http.Error(w, fmt.Sprintf("bad channel: %s<正整数, 1 起>", prefix), 400)
+				return
+			}
+			if allowed != nil && !allowed[ch] {
+				http.Error(w, fmt.Sprintf("channel %d not allowed", ch), 403)
+				return
+			}
+			w.Header().Set("Content-Type", "video/mp2t")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.WriteHeader(200)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush() // 立即发出响应头; 不等第一个 body 字节(无效通道/等待重连时客户端也能立即看到 200)
+			}
+			// 用户面通道 1 起; NVR 协议通道 = ch-1
+			stream := client.Stream(ch-1, res, *clean)
+			clientAddr := r.RemoteAddr
+			log.Printf("[%s%d] 客户端 %s 连入 (档位=%s)\n", prefix, ch, clientAddr, res)
+			defer log.Printf("[%s%d] 客户端 %s 断开\n", prefix, ch, clientAddr)
+			defer stream.Close()
+			buf := make([]byte, 1<<16)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				copyTo(w, stream, buf)
+			}()
+			select {
+			case <-done: // copyTo 因写失败/EOF 自行结束
+			case <-r.Context().Done():
+				// 客户端断开: 无数据流(空通道)时 copyTo 会一直阻塞在读上、
+				// 永远不会因写失败发现断开 —— 显式取消订阅并等拷贝协程退出,
+				// 避免空通道的 NVR 会话被永久占住(订阅泄漏)
+				stream.Close()
+				<-done
+			}
+			return
+		}
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ch/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			http.Error(w, "GET only", 405)
-			return
-		}
-		chS := strings.TrimPrefix(r.URL.Path, "/ch/")
-		ch, err := strconv.Atoi(chS)
-		if err != nil || ch < 1 {
-			http.Error(w, "bad channel: /ch/<正整数, 1 起>", 400)
-			return
-		}
-		if allowed != nil && !allowed[ch] {
-			http.Error(w, fmt.Sprintf("channel %d not allowed", ch), 403)
-			return
-		}
-		w.Header().Set("Content-Type", "video/mp2t")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(200)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush() // 立即发出响应头; 不等第一个 body 字节(无效通道/等待重连时客户端也能立即看到 200)
-		}
-		// 用户面通道 1 起; NVR 协议通道 = ch-1
-		stream := client.Stream(ch-1, *clean)
-		clientAddr := r.RemoteAddr
-		log.Printf("[/ch/%d] 客户端 %s 连入\n", ch, clientAddr)
-		defer log.Printf("[/ch/%d] 客户端 %s 断开\n", ch, clientAddr)
-		defer stream.Close()
-		buf := make([]byte, 1<<16)
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			copyTo(w, stream, buf)
-		}()
-		select {
-		case <-done: // copyTo 因写失败/EOF 自行结束
-		case <-r.Context().Done():
-			// 客户端断开: 无数据流(空通道)时 copyTo 会一直阻塞在读上、
-			// 永远不会因写失败发现断开 —— 显式取消订阅并等拷贝协程退出,
-			// 避免空通道的 NVR 会话被永久占住(订阅泄漏)
-			stream.Close()
-			<-done
-		}
-		return
-	})
+	mux.HandleFunc("/ch/", streamHandler(tplink.ResMain, "/ch/"))  // 主码流(高清)
+	mux.HandleFunc("/sub/", streamHandler(tplink.ResSub, "/sub/")) // 子码流(低清 640×480)
 
 	chList := "全部"
 	if allowed != nil {
 		chList = fmt.Sprintf("%v", keys(allowed))
 	}
-	log.Printf("nvr2rtc: NVR=%s user=%s 通道=%s → http://%s/ch/<N>\n", addr, *user, chList, *httpAd)
+	log.Printf("nvr2rtc: NVR=%s user=%s 通道=%s → http://%s/ch/<N> (主码流) , /sub/<N> (子码流)\n", addr, *user, chList, *httpAd)
 	if err := http.ListenAndServe(*httpAd, mux); err != nil {
 		log.Fatal("serve exit:", err)
 	}

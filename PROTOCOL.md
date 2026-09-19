@@ -3,7 +3,7 @@
 > 逆向来源：固件 rootfs 字符串/反汇编 + 手机 App（TP-Link 官方）8000 端口抓包
 > （`captures/tcp_*.pcap`，PCAPDroid 原始 IP 链路，linktype=101）+ 逐字节实测比对。
 > 验证时间：2026-08-23 ~ 2026-08-26，固件 1.0.25（Build 260609 Rel.51359n）。
-> Go 实现见 `nvrdl/`；本文档为目标读者是"想不靠 App 直接操作这台 NVR"的开发者。
+> Go 实现见 `tplink/`；本文档为目标读者是"想不靠 App 直接操作这台 NVR"的开发者。
 
 设备有两套 HTTP 服务器，职责完全不同：
 
@@ -38,7 +38,7 @@ def securityEncode(password):
     state = 0
     # 逐字符对 password 和 salt 做移位运算
 ```
-确切实现可直接读 `nvrdl/main.go` 的 `securityEncode`（与本型号逐字节比对待验）。
+确切实现可直接读 `tplink/tplink.go` 的 `securityEncode`（与本型号逐字节比对待验）。
 注意：**`securityEncode` 的输出同时是 Digest 密码**，即 Digest 里 `username=admin`，
 `password` 不是明文而是 securityEncode 后的结果。
 
@@ -158,6 +158,27 @@ Content-Length: <N>
 ```
 → 返回实时 TS，`video/mp2t` part。
 
+**`resolutions` 选码流档位（2026-09-20 实测，固件 1.0.25）**：
+
+该字段**只做子串匹配**，不理解真实分辨率名：
+
+| 取值 | 结果 |
+|---|---|
+| 含 `"HD"` 的串（`HD`/`HD1`/`xxHDxx`/`hdmi`） | 主码流 HEVC 2560×1440 15fps（~275KB/s） |
+| 含 `"VGA"` 的串（`VGA`/`QVGA`/`SVGA`/`NOTVGA`/`AAVGABB`） | 子码流 H.264 640×480 15fps（~30KB/s） |
+| 两者都含（`VGAHD`） | 主码流（HD 优先） |
+| 都不含（`SD`/`LD`/`1080P`/`MAIN`/`D1`/`CIF`/`720P`） | **HTTP 200 + 正确 JSON 响应，但零字节** |
+
+要点：
+- **静默空流**是"以为只有高清"的根因——不是被拒，是解析不出档位却没报错；
+- `VGA` ≡ `QVGA` ≡ `SVGA`：同一路 640×480 流（码率/编码参数/**SPS 字节**均相同，SHA1 一致）。
+  不存在更低的子码流，型号的子码流固定 640×480；
+- 大小写不敏感；子码流在物理通道 1–6 全部可用；
+- 响应 JSON 里**不含**分辨率/档位信息（只有 `error_code`/`session_id`），无法从响应判断档位。
+
+子码流的 TS 结构与主码流同构（PAT/PMT + H.264 `es_pid 0x44` + 私有流 `0x45`），
+`tsclean.go` 已支持 H.264(`0x1b`)，无需改动。
+
 **回放 playback2**（App 搜录像时发，本次抓包新确认）：
 ```json
 {"type":"request","seq":0,"params":{"method":"get","playback2":{
@@ -239,19 +260,29 @@ Content-Length: <N>
 |---|---|---|
 | 0x0000 (0) | PAT | 少量（流开头 4 次左右） |
 | 0x0012 (18) | PMT | program=1, PCR pid=0x44 |
-| 0x0044 (68) | 视频 | `stream_type 0x24` = HEVC，主码流 2560×1440（15fps 左右） |
+| 0x0044 (68) | 视频 | 主码流：`stream_type 0x24`=HEVC 2560×1440；子码流：`stream_type 0x1b`=H.264 640×480 |
 | 0x0045 (69) | 私有流 | `stream_type 0x92`，内容是 0xd5 填充 —— **App 认识/忽略，ffmpeg 不认** |
 | 0x1fff (8191) | null | 填充 |
 
-PMT 原文：
+主码流的 PMT 原文：
 ```
 program=1  pcr_pid=0x44
   stream_type=0x24 es_pid=0x44   (HEVC 视频)
   stream_type=0x92 es_pid=0x45   (TP-Link 私有流, 0xd5 填充)
 ```
 
-**给 ffmpeg/go2rtc 前应先清洗**：重写 PMT 只保留 `0x24` ES、重算 section_length + MPEG CRC32，
-并只转发 PAT/PMT/视频 PID（实现见 `nvrdl/serve.go` 的 `tsCleaner`）。
+子码流（`resolutions:["VGA"]`）的 PMT 原文 —— 结构同构，仅视频 stream_type 不同：
+```
+program=1  pcr_pid=0x44
+  stream_type=0x1b es_pid=0x44   (H.264 视频)
+  stream_type=0x92 es_pid=0x45   (TP-Link 私有流, 0xd5 填充)
+```
+
+两者 **PID 布局相同**（视频 0x44 / 私有 0x45），只有 `stream_type` 与编码内容不同；
+`tsclean.go` 的 `rebuildPMT` 同时接受 `0x1b`(H.264) 与 `0x24`(HEVC)，故主/子码流共用同一清洗器。
+
+**给 ffmpeg/go2rtc 前应先清洗**：重写 PMT 只保留视频 ES（`0x1b`/`0x24`）、重算 section_length + MPEG CRC32，
+并只转发 PAT/PMT/视频 PID（实现见 `tplink/tsclean.go` 的 `tsCleaner`）。
 拿到 PMT 前的开头视频包会丢弃（学习期，几毫秒，无感）。
 
 ### 3.7 scale 参数（回放调速，实测表）
@@ -284,12 +315,16 @@ program=1  pcr_pid=0x44
 
 - **没有原生 FTP/NAS 备份**：`backup_storage`/`backup_service` 在 1.0.22 和 1.0.25 都不存在；
   固件里的 `ftp_upload/ftp_download` 字符串是 nvrtest 自测项；`ConfLocalStorageBackup.htm`
-  是共享遗留页面。**NAS 自动备份只能靠外部工具拉录像**（本仓库 nvrdl 就是干这个的）；
+  是共享遗留页面。**NAS 自动备份只能靠外部工具拉录像**（如 ffmpeg / go2rtc）；
 - 通道编号：API `channel = 物理通道-1`（0=第1路…本机 0,2,3,5 = 物理 1/3/4/6 路）。
-  **本仓库 HTTP 端点 `/ch/<N>` 用物理通道号（1 起），提前做了 `N-1` 换算**（见 main.go）；
-- 单条流速率 = 实时码率（HEVC 2K 约 2~2.5Mbps）；8 路并发是协议给的上限；
+  **本仓库 HTTP 端点 `/ch/<N>`、`/sub/<N>` 用物理通道号（1 起），提前做了 `N-1` 换算**（见 main.go）；
+- 单条流速率 = 实时码率（主码流 HEVC 2K 约 2~2.5Mbps，子码流 H.264 640×480 约 240Kbps）；
+  8 路并发是协议给的上限；
+- **只有两档码流**：主码流(HD) 与子码流(VGA，固定 640×480)。`resolutions` 是子串匹配，
+  不存在更多档位（详见 3.3）；主/子码流各自占用独立会话，按 `stream_max_sessions` 计；
 - ffmpeg/VLC 打开本工具的 HTTP-TS 流很慢是 **ffmpeg 默认 probesize=5MB** 的探测行为，
-  与 NVR 协议无关；加 `-probesize 32768 -analyzeduration 100000` 即秒开（见 nvrdl/README.md）。
+  与 NVR 协议无关（子码流码率更低、默认探测更慢）；加 `-probesize 32768 -analyzeduration 100000`
+  即秒开（见 README.md）。
 
 ---
 
