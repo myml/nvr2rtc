@@ -1,74 +1,108 @@
 package tplink
 
-import "bytes"
+import (
+	"bytes"
+	"encoding/binary"
+)
 
-// tsCleaner: 把 NVR 的私有 TS 清洗成标准单视频流。
+// tsRemuxer: 把 NVR 的私有 TS 重封装成下游能直接识别的标准 A/V TS。
 //
-// NVR preview 流的 PMT 里声明了两个 ES: 0x24=HEVC 视频 + 0x92=私有流(内容为 0xd5 填充)。
-// ffmpeg/VLC 不认识 0x92，默认 probesize=5MB 时会一直读到 5MB 试图识别它，
-// 而流是 ~250KB/s 的实时节奏 → 客户端首帧要等 ~20 秒。清洗后只剩一路 HEVC。
-type tsCleaner struct {
-	buf      []byte // <188 字节的残留
-	pmtPID   int    // 从 PAT 学; -1=未知
-	videoPID int    // 从 PMT 学; -1=未知
-	cleanPMT []byte // 重写后的干净 PMT section(表格字节, 不含指针字段)
+// NVR preview 流的 PMT 里声明了两路 ES:
+//
+//	0x1b/0x24  视频 (H.264/HEVC)
+//	0x92       TP-Link 私有流 —— 内容不是 0xd5 填充，而是每包一个完整的
+//	           RIFF/WAVE 容器，fmt=6 (A-law)、单声道、8000Hz；WAVE 里的
+//	           data 块就是 PCMA 音频。
+//
+// ffmpeg 的 MPEG-TS 解复用器不认识 0x92；go2rtc 的原生 mpegts 解复用器
+// 虽然支持 0x90 (PCMA)，但只认 PMT 里声明的 PID。所以这里把 0x92 的
+// WAVE 头剥掉，重封装成标准 PCMA PES (stream_id 0xC0, stream_type 0x90,
+// PMT 里对应 ES 改成 0x90)，下游就能看到一条正常的 8kHz 单声道音频轨。
+//
+// clean=true 时额外丢掉 null/未知 PID（只保留 PAT/PMT/视频/音频）；
+// clean=false 时未知 PID 仍透传。两种模式都会转换私有音频。
+type tsRemuxer struct {
+	clean bool
+
+	buf []byte // <188 字节的残留
+
+	pmtPID     int    // 从 PAT 学; -1=未知
+	videoPID   int    // 从 PMT 学; -1=未知
+	audioPID   int    // 从 PMT 的 0x92 ES 学; -1=未知
+	pmtSection []byte // 重写后的 PMT section(含 CRC)；nil=不改写
+
+	audioBuf []byte // 私有音频 PES 重组缓冲
+	audioCC  int    // 输出音频 PID 的 continuity counter
+	audioPTS uint64 // 原始 PES 没有 PTS 时的回退时间戳(90kHz)
 }
 
-func newTSCleaner() *tsCleaner {
-	return &tsCleaner{pmtPID: -1, videoPID: -1}
+func newTSRemuxer(clean bool) *tsRemuxer {
+	return &tsRemuxer{clean: clean, pmtPID: -1, videoPID: -1, audioPID: -1}
 }
 
-// feed: 输入任意长度的 TS 字节流(可跨 part 边界), 返回清洗后的标准 TS 字节。
-func (c *tsCleaner) feed(in []byte) []byte {
-	c.buf = append(c.buf, in...)
+// feed: 输入任意长度的 TS 字节流(可跨 part 边界), 返回重封装后的标准 TS 字节。
+func (r *tsRemuxer) feed(in []byte) []byte {
+	r.buf = append(r.buf, in...)
 	var out []byte
-	n := len(c.buf)
+	n := len(r.buf)
 	start := 0
-	for start+188 <= n {
-		if c.buf[start] != 0x47 {
+	for start+tsPacketSize <= n {
+		if r.buf[start] != 0x47 {
 			// 丢开对齐前, 找下一个 0x47 作为包边界(最多往后扫 188*2 字节)
-			lim := start + 188*2
+			lim := start + tsPacketSize*2
 			if lim > n {
 				lim = n
 			}
-			j := bytes.IndexByte(c.buf[start+1:lim], 0x47)
+			j := bytes.IndexByte(r.buf[start+1:lim], 0x47)
 			if j < 0 {
 				break
 			}
 			start += 1 + j
-			if start+188 > n {
+			if start+tsPacketSize > n {
 				break
 			}
 		}
-		pkt := c.buf[start : start+188]
+		pkt := r.buf[start : start+tsPacketSize]
 		pid := (int(pkt[1]&0x1f) << 8) | int(pkt[2])
 		switch {
-		case pid == 0: // PAT 学习 PMT PID 并透传
-			c.learnPAT(pkt)
+		case pid == 0: // PAT: 学 PMT PID 并透传
+			r.learnPAT(pkt)
 			out = append(out, pkt...)
-		case c.videoPID >= 0 && pid == c.videoPID:
-			out = append(out, pkt...)
-		case c.pmtPID >= 0 && pid == c.pmtPID:
-			if c.cleanPMT == nil {
-				if sec := extractPMTSection(pkt); sec != nil {
-					c.cleanPMT = c.rebuildPMT(sec)
-				}
+		case r.pmtPID >= 0 && pid == r.pmtPID:
+			if sec := extractPMTSection(pkt); sec != nil {
+				r.learnPMT(sec)
 			}
-			if c.cleanPMT != nil {
-				out = append(out, rewritePMTPkt(pkt, c.cleanPMT)...)
+			if r.pmtSection != nil {
+				out = append(out, rewritePMTPkt(pkt, r.pmtSection)...)
 			} else {
-				out = append(out, pkt...) // 还没学到就原样转发
+				out = append(out, pkt...)
 			}
-		default: // 私有流 0x92 / null / SDT 等一律丢弃
+		case r.videoPID >= 0 && pid == r.videoPID:
+			out = append(out, pkt...)
+		case r.audioPID >= 0 && pid == r.audioPID:
+			r.feedAudioPacket(pkt, &out)
+		default: // 私有流/未知 PID/null
+			if !r.clean {
+				out = append(out, pkt...)
+			}
 		}
-		start += 188
+		start += tsPacketSize
 	}
-	c.buf = append(c.buf[:0], c.buf[start:]...)
+	r.buf = append(r.buf[:0], r.buf[start:]...)
 	return out
 }
 
+const (
+	tsPacketSize = 188
+
+	streamTypeH264         = 0x1b
+	streamTypeHEVC         = 0x24
+	streamTypePrivateAudio = 0x92 // TP-Link 私有 WAVE/A-law
+	streamTypePCMA         = 0x90 // 标准 G.711 A-law (go2rtc 原生 mpegts 支持)
+)
+
 // learnPAT: 解析 PAT(表 id 0x00) 找到 PMT PID
-func (c *tsCleaner) learnPAT(pkt []byte) {
+func (r *tsRemuxer) learnPAT(pkt []byte) {
 	s := tsSection(pkt, 0x00)
 	if s == nil || len(s) < 12 {
 		return
@@ -78,19 +112,273 @@ func (c *tsCleaner) learnPAT(pkt []byte) {
 	if end > len(s) {
 		end = len(s)
 	}
-	pos := 8
-	for pos+4 <= end {
+	for pos := 8; pos+4 <= end; pos += 4 {
 		pn := (int(s[pos]&0x1f) << 8) | int(s[pos+1])
 		if pn != 0 {
-			c.pmtPID = (int(s[pos+2]&0x1f) << 8) | int(s[pos+3])
+			r.pmtPID = (int(s[pos+2]&0x1f) << 8) | int(s[pos+3])
 		}
-		pos += 4
 	}
+}
+
+// learnPMT: 解析 PMT，记录视频/私有音频 PID，并生成重写后的 PMT：
+// 视频 ES 原样保留，0x92 改成 0x90(PCMA, 无 ES info)，其余按 clean 取舍。
+func (r *tsRemuxer) learnPMT(sec []byte) {
+	if len(sec) < 16 {
+		return
+	}
+	body := sec[:len(sec)-4] // 去掉 CRC
+	if len(body) < 12 {
+		return
+	}
+	progInfoLen := (int(body[10]&0x0f) << 8) | int(body[11])
+	pos := 12 + progInfoLen
+	if pos > len(body) {
+		return
+	}
+	head := body[:pos] // table id + section_length + program header + program_info
+	var kept []byte
+	haveVideo := false
+	audioPID := -1
+	for pos+5 <= len(body) {
+		st := body[pos]
+		epid := (int(body[pos+1]&0x1f) << 8) | int(body[pos+2])
+		elen := (int(body[pos+3]&0x0f) << 8) | int(body[pos+4])
+		if pos+5+elen > len(body) {
+			break
+		}
+		entry := body[pos : pos+5+elen]
+		switch {
+		case st == streamTypeH264 || st == streamTypeHEVC:
+			kept = append(kept, entry...)
+			haveVideo = true
+			r.videoPID = epid
+		case st == streamTypePrivateAudio && audioPID < 0:
+			// 同一 PID 改成标准 PCMA，ES info 丢弃（PCMA 不需要描述符）
+			audioPID = epid
+			kept = append(kept, streamTypePCMA, entry[1], entry[2], 0xF0, 0x00)
+		default:
+			if !r.clean {
+				kept = append(kept, entry...)
+			}
+		}
+		pos += 5 + elen
+	}
+
+	// 没有私有音频且是透传模式：不改 PMT，保持原始字节
+	if audioPID < 0 && !r.clean {
+		r.pmtSection = nil
+		return
+	}
+	if audioPID >= 0 {
+		r.audioPID = audioPID
+	}
+	if len(kept) == 0 && !haveVideo {
+		r.pmtSection = nil
+		return
+	}
+
+	nb := append([]byte{}, head...)
+	nb = append(nb, kept...)
+	newLen := len(nb) - 3 + 4 // section_length 语义: 其后到 CRC 结束
+	if newLen > 0x3FD {
+		r.pmtSection = nil
+		return
+	}
+	nb[1] = 0x30 | byte((newLen>>8)&0x0f)
+	nb[2] = byte(newLen & 0xff)
+	crc := mpegCRC32(nb)
+	nb = append(nb, byte(crc>>24), byte(crc>>16), byte(crc>>8), byte(crc))
+	r.pmtSection = nb
+}
+
+// feedAudioPacket: 把私有 PID 的 TS 包重组为 PES；收到完整 PES 就转成
+// 标准 PCMA PES 输出到 out。
+func (r *tsRemuxer) feedAudioPacket(pkt []byte, out *[]byte) {
+	payload, pusi := tsPayload(pkt)
+	if payload == nil {
+		return
+	}
+	if pusi {
+		// 上一包如果还没收全，丢弃；完整 PES 在下面的常规路径已经处理过。
+		r.audioBuf = r.audioBuf[:0]
+	} else if len(r.audioBuf) == 0 {
+		return // 没等到起始包
+	}
+	r.audioBuf = append(r.audioBuf, payload...)
+	r.flushAudio(out)
+}
+
+// flushAudio: 从 audioBuf 里切出完整 PES 并转换。
+func (r *tsRemuxer) flushAudio(out *[]byte) {
+	for len(r.audioBuf) >= 6 {
+		plen := (int(r.audioBuf[4]) << 8) | int(r.audioBuf[5])
+		if plen == 0 { // 无长度：等到下一个 PUSI 时丢弃半包
+			return
+		}
+		total := 6 + plen
+		if len(r.audioBuf) < total {
+			return
+		}
+		pes := make([]byte, total)
+		copy(pes, r.audioBuf[:total])
+		r.audioBuf = append(r.audioBuf[:0], r.audioBuf[total:]...)
+		data, pts, ok := parseAudioPES(pes)
+		if !ok {
+			continue
+		}
+		r.emitAudioPES(data, pts, out)
+	}
+}
+
+// parseAudioPES: 从私有 PES 里取出 WAVE 的 A-law data 和 PTS。
+func parseAudioPES(pes []byte) (data, pts []byte, ok bool) {
+	if len(pes) < 9 || pes[0] != 0 || pes[1] != 0 || pes[2] != 1 {
+		return nil, nil, false
+	}
+	total := len(pes)
+	if plen := (int(pes[4]) << 8) | int(pes[5]); plen != 0 {
+		total = 6 + plen
+		if len(pes) < total {
+			return nil, nil, false
+		}
+	}
+	hlen := int(pes[8])
+	if 9+hlen > total {
+		return nil, nil, false
+	}
+	if pes[7]&0x80 != 0 && hlen >= 5 {
+		pts = pes[9:14]
+	}
+	data = wavALaw(pes[9+hlen : total])
+	if data == nil {
+		return nil, nil, false
+	}
+	return data, pts, true
+}
+
+// wavALaw: 解析 RIFF/WAVE 容器，返回 8kHz A-law data 块。
+// 只接受 fmt=6(WAVE_FORMAT_ALAW)；其它格式返回 nil（不猜测）。
+func wavALaw(b []byte) []byte {
+	if len(b) < 12 || !bytes.Equal(b[:4], []byte("RIFF")) || !bytes.Equal(b[8:12], []byte("WAVE")) {
+		return nil
+	}
+	pos := 12
+	var data []byte
+	format := -1
+	for pos+8 <= len(b) {
+		id := b[pos : pos+4]
+		size := int(binary.LittleEndian.Uint32(b[pos+4:]))
+		body := pos + 8
+		if size < 0 || body > len(b) {
+			break
+		}
+		end := body + size
+		if end > len(b) {
+			end = len(b)
+		}
+		switch string(id) {
+		case "fmt ":
+			if size >= 16 && body+16 <= len(b) {
+				format = int(binary.LittleEndian.Uint16(b[body:]))
+			}
+		case "data":
+			data = b[body:end]
+		}
+		pos = end + (size & 1)
+	}
+	if format != 6 || data == nil {
+		return nil
+	}
+	return data
+}
+
+// emitAudioPES: 把一段 A-law 数据封装成 PCMA PES 并写入 TS 包。
+func (r *tsRemuxer) emitAudioPES(data, pts []byte, out *[]byte) {
+	if len(data) == 0 {
+		return
+	}
+	if len(data) > 65527 { // PES_packet_length 上限 65535，减去 8 字节头
+		data = data[:65527]
+	}
+	length := 8 + len(data)
+	pes := make([]byte, 0, 6+length)
+	pes = append(pes, 0x00, 0x00, 0x01, 0xC0, byte(length>>8), byte(length), 0x80, 0x80, 0x05)
+	if len(pts) == 5 {
+		pes = append(pes, pts...)
+	} else {
+		pes = append(pes, encodePTS(r.audioPTS)...)
+		r.audioPTS += uint64(len(data)) * 90000 / 8000
+	}
+	pes = append(pes, data...)
+	writePESPackets(r.audioPID, &r.audioCC, pes, out)
+}
+
+// encodePTS: 5 字节 PTS (33-bit, 90kHz)
+func encodePTS(pts uint64) []byte {
+	return []byte{
+		0x21 | byte((pts>>29)&0x0E),
+		byte(pts >> 22),
+		0x01 | byte((pts>>14)&0xFE),
+		byte(pts >> 7),
+		0x01 | byte((pts<<1)&0xFE),
+	}
+}
+
+// writePESPackets: 把一个 PES 切成 188 字节 TS 包。最后一包用 adaptation
+// field 填充，避免把填充字节当成 PCMA 采样。
+func writePESPackets(pid int, cc *int, pes []byte, out *[]byte) {
+	first := true
+	for len(pes) > 0 {
+		pkt := make([]byte, tsPacketSize)
+		pkt[0] = 0x47
+		pkt[1] = byte((pid >> 8) & 0x1f)
+		if first {
+			pkt[1] |= 0x40 // payload_unit_start_indicator
+		}
+		pkt[2] = byte(pid)
+		if len(pes) >= 184 {
+			pkt[3] = 0x10 | byte(*cc&0x0f)
+			copy(pkt[4:], pes[:184])
+			pes = pes[184:]
+		} else {
+			afl := 183 - len(pes)
+			pkt[3] = 0x30 | byte(*cc&0x0f)
+			pkt[4] = byte(afl)
+			for i := 5; i < 5+afl; i++ {
+				if i == 5 {
+					pkt[i] = 0x00 // adaptation field flags
+				} else {
+					pkt[i] = 0xFF // stuffing
+				}
+			}
+			copy(pkt[5+afl:], pes)
+			pes = nil
+		}
+		*cc = (*cc + 1) & 0x0f
+		first = false
+		*out = append(*out, pkt...)
+	}
+}
+
+// tsPayload: 返回 TS 包的载荷与 PUSI；无载荷返回 nil。
+func tsPayload(pkt []byte) ([]byte, bool) {
+	afc := (pkt[3] >> 4) & 0x03
+	if afc == 0 || afc == 2 {
+		return nil, false
+	}
+	pos := 4
+	if afc == 3 {
+		pos += 1 + int(pkt[4])
+	}
+	if pos >= tsPacketSize {
+		return nil, false
+	}
+	return pkt[pos:], pkt[1]&0x40 != 0
 }
 
 // tsSection: 从 TS 包提取完整 PSI section(含 CRC), 校验 table id; 跨包/不完整的返回 nil
 func tsSection(pkt []byte, wantTable byte) []byte {
-	afc := pkt[3] & 0x03
+	afc := (pkt[3] >> 4) & 0x03
 	if afc != 1 && afc != 3 {
 		return nil
 	}
@@ -98,11 +386,15 @@ func tsSection(pkt []byte, wantTable byte) []byte {
 	if afc == 3 {
 		po += 1 + int(pkt[4])
 	}
-	if po+3 > 188 {
+	if po+3 > tsPacketSize {
 		return nil
 	}
 	ptr := int(pkt[po])
-	s := pkt[po+1+ptr:]
+	start := po + 1 + ptr
+	if start > tsPacketSize {
+		return nil
+	}
+	s := pkt[start:]
 	if len(s) < 12 || s[0] != wantTable {
 		return nil
 	}
@@ -116,54 +408,19 @@ func tsSection(pkt []byte, wantTable byte) []byte {
 // extractPMTSection: 同 tsSection 但专门取 PMT(表 id 0x02)
 func extractPMTSection(pkt []byte) []byte { return tsSection(pkt, 0x02) }
 
-// rebuildPMT: 重写 PMT section —— 只保留视频 ES(0x1b H.264 / 0x24 HEVC),
-// 更新 section_length 并重算 MPEG CRC32。同时把视频 PID 回写到 c.videoPID。
-func (c *tsCleaner) rebuildPMT(sec []byte) []byte {
-	if len(sec) < 16 {
-		return nil
-	}
-	body := sec[:len(sec)-4] // 去掉 CRC
-	// program_info_length 的高 4 位在 body[10] 低半字节、低 8 位在 body[11]；
-	// 必须先转 int 再移位（byte<<8 在 Go 中恒为 0，见同文件 learnPAT 的写法）
-	pos := 12 + (int(body[10]&0x0f)<<8 | int(body[11]))
-	var kept []byte
-	newPID := -1
-	for pos+5 <= len(body) {
-		st := body[pos]
-		epid := (int(body[pos+1]&0x1f) << 8) | int(body[pos+2])
-		elen := (int(body[pos+3]&0x0f) << 8) | int(body[pos+4])
-		if pos+5+elen > len(body) {
-			break
-		}
-		if st == 0x1b || st == 0x24 {
-			kept = append(kept, body[pos:pos+5+elen]...)
-			newPID = epid
-		}
-		pos += 5 + elen
-	}
-	if newPID < 0 {
-		return nil
-	}
-	c.videoPID = newPID
-	nb := append([]byte{}, body[:12]...)
-	nb = append(nb, kept...)
-	newLen := len(nb) - 3 + 4 // section_length 字段的语义: 其后到 CRC 结束
-	nb[1] = 0x30 | byte((newLen>>8)&0x0f)
-	nb[2] = byte(newLen & 0xff)
-	crc := mpegCRC32(nb)
-	nb = append(nb, byte(crc>>24), byte(crc>>16), byte(crc>>8), byte(crc))
-	return nb
-}
-
-// rewritePMTPkt: 用干净 PMT section 重写一个 PMT 包: 保留 TS 头, 载荷=指针字段+新 section+0xFF 填充
+// rewritePMTPkt: 用重写后的 PMT section 替换一个 PMT 包: 保留 TS 头,
+// 载荷=指针字段+新 section+0xFF 填充。
 func rewritePMTPkt(pkt []byte, newSection []byte) []byte {
-	p := make([]byte, 188)
-	copy(p, pkt[:4])          // TS 头
-	p[1] |= 0x40              // payload_unit_start_indicator
-	p[3] = pkt[3]&0xf0 | 0x01 // 纯载荷, 无 adaptation field
-	p[4] = 0                  // pointer_field
-	copy(p[5:], newSection)   // 新 PMT section
-	for j := 5 + len(newSection); j < 188; j++ {
+	if len(newSection) > tsPacketSize-5 {
+		return pkt
+	}
+	p := make([]byte, tsPacketSize)
+	copy(p, pkt[:4])                                // TS 头
+	p[1] |= 0x40                                    // payload_unit_start_indicator
+	p[3] = (pkt[3] & 0xC0) | 0x10 | (pkt[3] & 0x0F) // 纯载荷(afc=1), 保留 CC
+	p[4] = 0                                        // pointer_field
+	copy(p[5:], newSection)
+	for j := 5 + len(newSection); j < tsPacketSize; j++ {
 		p[j] = 0xFF // 填充
 	}
 	return p

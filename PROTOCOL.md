@@ -252,38 +252,67 @@ Content-Length: <N>
 
 `X-Session-Id` 从响应 JSON part 里提取（`session_id`），后续回发确认要用。
 
-### 3.6 媒体流结构（本次抓包新确认，preview）
+### 3.6 媒体流结构（preview）
 
 原始 TS 里（PID 统计实测）：
 
 | PID | 值 | 内容 |
 |---|---|---|
-| 0x0000 (0) | PAT | 少量（流开头 4 次左右） |
+| 0x0000 (0) | PAT | 少量（流开头几次） |
 | 0x0012 (18) | PMT | program=1, PCR pid=0x44 |
 | 0x0044 (68) | 视频 | 主码流：`stream_type 0x24`=HEVC 2560×1440；子码流：`stream_type 0x1b`=H.264 640×480 |
-| 0x0045 (69) | 私有流 | `stream_type 0x92`，内容是 0xd5 填充 —— **App 认识/忽略，ffmpeg 不认** |
+| 0x0045 (69) | 音频 | `stream_type 0x92`，PES 载荷是 RIFF/WAVE(A-law) 容器（见 3.6.1） |
 | 0x1fff (8191) | null | 填充 |
 
 主码流的 PMT 原文：
 ```
 program=1  pcr_pid=0x44
   stream_type=0x24 es_pid=0x44   (HEVC 视频)
-  stream_type=0x92 es_pid=0x45   (TP-Link 私有流, 0xd5 填充)
+  stream_type=0x92 es_pid=0x45   (TP-Link 私有音频)
 ```
 
 子码流（`resolutions:["VGA"]`）的 PMT 原文 —— 结构同构，仅视频 stream_type 不同：
 ```
 program=1  pcr_pid=0x44
   stream_type=0x1b es_pid=0x44   (H.264 视频)
-  stream_type=0x92 es_pid=0x45   (TP-Link 私有流, 0xd5 填充)
+  stream_type=0x92 es_pid=0x45   (TP-Link 私有音频)
 ```
 
-两者 **PID 布局相同**（视频 0x44 / 私有 0x45），只有 `stream_type` 与编码内容不同；
-`tsclean.go` 的 `rebuildPMT` 同时接受 `0x1b`(H.264) 与 `0x24`(HEVC)，故主/子码流共用同一清洗器。
+两者 **PID 布局相同**（视频 0x44 / 音频 0x45），只有 `stream_type` 与编码内容不同。
 
-**给 ffmpeg/go2rtc 前应先清洗**：重写 PMT 只保留视频 ES（`0x1b`/`0x24`）、重算 section_length + MPEG CRC32，
-并只转发 PAT/PMT/视频 PID（实现见 `tplink/tsclean.go` 的 `tsCleaner`）。
-拿到 PMT 前的开头视频包会丢弃（学习期，几毫秒，无感）。
+### 3.6.1 私有音频流 0x92（重要更正）
+
+早期抓包把 0x45 当成 "0xd5 填充" —— 这是误判：**0xd5 只是 A-law 数字静音**。
+逐 PES 解析后，0x92 的真实结构是：
+
+```
+TS PID 0x45, PUSI=1
+  PES: 00 00 01 C0 | packet_length=0x0434 | 80 80 05 | PTS(5B)
+  payload (1068B):
+    "RIFF" <size=0x424> "WAVE"
+    "fmt " <16> : format=0x0006 (WAVE_FORMAT_ALAW), channels=1,
+                  sample_rate=8000, byte_rate=8000, block_align=1, bits=8
+    "data" <size=0x400> : 1024 字节 A-law 采样
+```
+
+- 每个 PES 一个完整 WAVE 容器；1024 字节 A-law = 128ms @ 8kHz，约 8 个 PES/秒；
+- **音频内容基本是数字静音**（0xD5/0x55），不是"没有音频"；实测本机 6 路
+  2 秒抓包解码后 RMS≈8–15（个别采样到 ±100 左右），说明 NVR 并未转发相机
+  麦克风的真实环境声；
+- 相机自己的 RTSP（例如 `rtsp://admin:<相机密码>@192.168.0.226/stream1?channel=1`）
+  实测带 `pcm_alaw 8000Hz mono`，RMS≈27、peak≈216，是真实环境声；
+- `0x92` 是私有类型，go2rtc 原生 mpegts 解复用器只认 `0x90`(PCMA) / `0x91`(PCMU)；
+  ffmpeg 7.x 的 mpegts 解复用器则连 `0x90` 也不认（会当 data）——所以给 ffmpeg 的
+  TS 里放 PCMA 并不能让它看到音轨。
+
+`tplink/tsclean.go` 的 `tsRemuxer` 做两件事：
+1. 把 PMT 里的 `stream_type 0x92` 改成 `0x90`，PID 不变，重算 section_length + MPEG CRC32；
+2. 把每个私有 PES 的 WAVE 壳剥掉，只留 A-law data，按标准 PCMA PES
+   (`stream_id 0xC0`, PTS 沿用原 PES) 重新打包；最后一包用 adaptation field 填充，
+   避免把 0xFF 填充当成音频采样。
+
+这样 go2rtc 的原生 HTTP-TS 源 (`http://.../ch/N`) 就能同时拿到视频 + PCMA 音频；
+`--clean` 只额外剔除 null/未知 PID。拿到 PMT 前的开头包会丢弃（学习期，几毫秒，无感）。
 
 ### 3.7 scale 参数（回放调速，实测表）
 
@@ -324,7 +353,13 @@ program=1  pcr_pid=0x44
   不存在更多档位（详见 3.3）；主/子码流各自占用独立会话，按 `stream_max_sessions` 计；
 - ffmpeg/VLC 打开本工具的 HTTP-TS 流很慢是 **ffmpeg 默认 probesize=5MB** 的探测行为，
   与 NVR 协议无关（子码流码率更低、默认探测更慢）；加 `-probesize 32768 -analyzeduration 100000`
-  即秒开（见 README.md）。
+  即秒开（见 README.md）；
+- **NVR 预览音频是静音占位**：0x92 里的 A-law 基本全是 0xD5，NVR 不转发相机 mic。
+  本工具会把这条音轨转成标准 PCMA(0x90)，音轨能出现，但通常听不到声音；
+  要真实声音请直连相机 RTSP（go2rtc 用 `#media=audio` 作为第二源）；
+- **ffmpeg 7.x 的 mpegts 解复用器不认 PCMA(0x90)**，所以直接用 ffmpeg 拉本工具的
+  HTTP-TS 时音频仍不会出现；请用 go2rtc 的原生 `http://` 源（内置 pkg/mpegts），
+  或让 ffmpeg 走相机 RTSP / 自行转码。
 
 ---
 

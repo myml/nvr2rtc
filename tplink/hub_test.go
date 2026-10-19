@@ -84,9 +84,7 @@ func TestTSRingCloseUnblocksReader(t *testing.T) {
 
 func newTestHub(clean bool) *hub {
 	h := &hub{clean: clean, c: &Client{}, subs: map[*sub]struct{}{}, wake: make(chan struct{}, 1)}
-	if clean {
-		h.cleaner = newTSCleaner()
-	}
+	h.remuxer = newTSRemuxer(clean)
 	return h
 }
 
@@ -295,7 +293,7 @@ func buildTestTS() []byte {
 	var ts []byte
 	// PAT 包: pid=0, section: table 0x00, slen=13
 	pat := tsPkt(0, []byte{
-		0xB0, 0x0D,
+		0x00, 0xB0, 0x0D,
 		0x00, 0x01, // transport_stream_id
 		0x01, 0x00, 0x00, // version/cur, sec, last
 		0x00, 0x01, 0xE1, 0x00, // program 1 → PMT pid 0x100
@@ -304,7 +302,7 @@ func buildTestTS() []byte {
 	ts = append(ts, pat...)
 	// PMT 包: pid=0x100, slen=18, program_info_length=0, ES: 0x24 HEVC pid 0x101
 	pmt := tsPkt(0x100, []byte{
-		0xB0, 0x12,
+		0x02, 0xB0, 0x12,
 		0x00, 0x01, // program_number
 		0x01, 0x00, 0x00, // version/cur, sec, last
 		0xE1, 0x01, // PCR pid 0x101
@@ -317,14 +315,14 @@ func buildTestTS() []byte {
 	vid[0] = 0x47
 	vid[1] = 0x41 // pid 0x101 | payload_unit_start
 	vid[2] = 0x01
-	vid[3] = 0x01
+	vid[3] = 0x11 // payload only (afc=1), CC=1
 	ts = append(ts, vid...)
 	for i := 0; i < 3; i++ {
 		priv := make([]byte, 188)
 		priv[0] = 0x47
 		priv[1] = 0x21 // pid 0x192
 		priv[2] = 0x92
-		priv[3] = 0x01
+		priv[3] = 0x11 // payload only (afc=1), CC=1
 		ts = append(ts, priv...)
 	}
 	return ts
@@ -337,7 +335,7 @@ func tsPkt(pid int, payload []byte) []byte {
 	pkt[0] = 0x47
 	pkt[1] = byte(pid>>8) | 0x40 | 0x20
 	pkt[2] = byte(pid)
-	pkt[3] = 0x01 // 纯载荷
+	pkt[3] = 0x11 // 纯载荷(afc=1), CC=1
 	pkt[4] = 0    // pointer_field
 	copy(pkt[5:], payload)
 	for i := 5 + len(payload); i < 188; i++ {

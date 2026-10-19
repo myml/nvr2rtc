@@ -34,7 +34,7 @@ func main() {
 		pass   = flag.String("pass", envOr("NVR2RTC_PASS", ""), "NVR 管理员密码")
 		httpAd = flag.String("http", envOr("NVR2RTC_HTTP", "0.0.0.0:8081"), "HTTP 监听地址")
 		allow  = flag.String("ch", "", "通道白名单(逗号分隔, 1 起, 如 1,3,4,6); 默认不限制(任意 1..N 通道, N 取决于 NVR 路数)")
-		clean  = flag.Bool("clean", false, "清洗 TS：剔除 TP-Link 私有流(0x92)，只保留视频流；默认透传原始流")
+		clean  = flag.Bool("clean", false, "清洗 TS：剔除非音视频 PID(null/未知流)，保留视频+标准 PCMA 音频；默认只转换私有音频，其余透传")
 	)
 	flag.Parse()
 

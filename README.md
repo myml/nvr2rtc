@@ -11,13 +11,15 @@ nvr2rtc --user admin --pass 123456  --ch 1,3,4,6
 ```
 
 - 输出端点：
-  - `http://<host>:8081/ch/<N>` — **主码流**（高清，HEVC 2560×1440）
-  - `http://<host>:8081/sub/<N>` — **子码流**（低清，H.264 640×480）
+  - `http://<host>:8081/ch/<N>` — **主码流**（高清，HEVC 2560×1440 + 8kHz PCMA 音频）
+  - `http://<host>:8081/sub/<N>` — **子码流**（低清，H.264 640×480 + 8kHz PCMA 音频）
 
   N = 通道号，**1 起**，与 TP-Link 客户端的第 1/N 路一一对应（协议内部 API 通道为 N-1，见 PROTOCOL.md）。
   两条路径都是固定档位、互不影响；同一个通道的主/子码流各占一路 NVR 会话。
-- 默认**透传原始流**（含 TP-Link 私有流 0x92 与 null 填充）；加 `--clean` 开关做 TS 清洗
-  （只保留视频 PID，剔除私有流）——清洗不影响启动速度，只是让下游工具看到的流更干净
+- NVR 的音频不是标准 ES，而是藏在 PMT 的 **0x92 私有流**里：每个 PES 是一个
+  RIFF/WAVE 容器（fmt=6 A-law、单声道、8000Hz）。本工具会剥掉 WAVE 壳，重封装成
+  标准 **PCMA（stream_type 0x90）**，所以下游能直接看到一条正常音频轨。
+  默认只转换音频、其余透传；加 `--clean` 额外剔除非音视频 PID（null/未知流）。
 - 断流自动重连；**同一通道同一档位多个客户端共享一路 NVR 会话（扇出）**，多通道/多档位各自独立连接 NVR
 
 > 共享会话：同一通道同一档位被多个客户端（ffplay / go2rtc / VLC）同时拉取时，NVR 侧只建立
@@ -39,37 +41,42 @@ nvr2rtc --user admin --pass 123456  --ch 1,3,4,6
 | `--ch` | 不限制 | 通道白名单（逗号分隔，1 起，如 `1,3,4,6`）。**默认不限制**——任意正整数通道都放行，
   有没有数据由 NVR 决定（不同型号路数不同，如 8/16/32 路）；指定后其余通道返回 403。
   白名单同时作用于 `/ch/` 与 `/sub/` |
-| `--clean` | 关 | 清洗 TS：剔除 TP-Link 私有流(0x92)，只保留视频流。默认透传原始流 |
+| `--clean` | 关 | 剔除非音视频 PID（null/未知流）。私有音频 0x92 在所有模式下都会转成标准 PCMA |
 
-## 接入 go2rtc
-
-```yaml
-streams:
-  cam1:          # 主码流
-    ffmpeg: http://192.168.0.60:8081/ch/1#video=copy
-  cam1_sub:      # 子码流（省带宽，适合多路预览/手机端）
-    ffmpeg: http://192.168.0.60:8081/sub/1#video=copy
-  cam3:
-    ffmpeg: http://192.168.0.60:8081/ch/3#video=copy
-```
-
-> **重要**：ffmpeg 系客户端默认 `-probesize 5MB`，对 1× 实时流（主码流 ~250KB/s）要读满
-> 5MB 探测才开始解码 ≈ 20 秒。**给 ffmpeg 加参数即秒开**（子码流码率低，默认探测更慢，
-> 更需要加）：
+## 接入 go2rtc（要音频就用原生 HTTP 源）
 
 ```yaml
 streams:
-  cam1_sub:
-    ffmpeg2:
-      - -probesize
-      - "32768"
-      - -analyzeduration
-      - "100000"
-      - -i
-      - http://192.168.0.60:8081/sub/1
+  cam1: http://192.168.0.60:8081/ch/1          # 主码流 + PCMA 音频
+  cam1_sub: http://192.168.0.60:8081/sub/1    # 子码流 + PCMA 音频
+  cam3: http://192.168.0.60:8081/ch/3
 ```
 
-命令行直接拉流：
+> **不要用 `ffmpeg:` 源取音频**。go2rtc 的 `http://` 源走内置 `pkg/mpegts`
+> 解复用器，能识别 PCMA(0x90)；而 ffmpeg 7.x 的 MPEG-TS 解复用器不认
+> stream_type 0x90，会把这条音轨当 data 丢掉。用原生源也没有 `-probesize 5MB`
+> 的探测延迟，直接秒开。
+>
+> 如果确实要用 `ffmpeg:`（例如只取视频），视频仍正常；音频需要走相机 RTSP
+> 或额外转码（AAC/Opus）。
+
+### 相机音频（NVR 不转发时）
+
+实测固件 1.0.25 的 NVR **预览音频是数字静音**（A-law 0xD5），相机麦克风的
+声音不会经 NVR 转发；但相机自己的 RTSP 通常带 PCMA 音频。可以把相机 RTSP
+作为**纯音频**第二源（`#media=audio`），放在前面以确保选中它：
+
+```yaml
+streams:
+  cam6:
+    - 'rtsp://admin:<相机密码>@192.168.0.226/stream1?channel=1#media=audio'
+    - http://192.168.0.60:8081/ch/6
+```
+
+> 需要相机自己的密码（不是 NVR 密码）。`#media=audio` 只取音频、不重复取视频。
+> 如果相机本身没开麦克风/没接 mic，听到的仍是静音。
+
+命令行直接拉流（ffmpeg 只能看到视频；PCMA 音轨会被忽略）：
 
 ```bash
 ffmpeg -probesize 32768 -analyzeduration 100000 -i http://<host>:8081/ch/1  -c copy out.ts   # 主码流
@@ -109,8 +116,9 @@ WantedBy=multi-user.target
 main.go        CLI + HTTP 服务器 (/ch/ 主码流, /sub/ 子码流)
 tplink/
   tplink.go    NVR 协议: securityEncode、Digest、preview 会话、档位、信用流控
-  tsclean.go   TS 清洗: PMT 重写剔除私有流(0x92)
+  tsclean.go   TS 重封装: 私有音频 0x92 (WAVE/A-law) → 标准 PCMA(0x90)
   hub_test.go  共享会话扇出 / 档位 / 请求体 单元测试
+  tsclean_test.go  音频重封装 / PMT 重写 / 分包边界 单元测试
 probe/         一次性逆向工具: 爆破 preview 请求参数(见下)
 ```
 

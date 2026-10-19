@@ -4,7 +4,9 @@
 //   - HTTP Digest 认证（凭据 = securityEncode(密码)，Digest 值必须带引号）
 //   - 两步 POST /stream 握手（Content-Length: -1，需原生 TCP）
 //   - multipart/mixed JSON 信封 + 信用流控（X-Data-Window-Size / stream_sequence）
-//   - 响应 multipart 解析（video/mp2t part + JSON part），TS 清洗（见 tsclean.go）
+//   - 响应 multipart 解析（video/mp2t part + JSON part）
+//   - TS 重封装（见 tsclean.go）：私有音频流 0x92 (RIFF/WAVE + A-law)
+//     转成标准 PCMA(0x90)，下游 go2rtc/原生 mpegts 解复用器能看到音轨
 //   - 码流档位：ResMain("HD")=主码流（高清 HEVC 2560×1440），
 //     ResSub("VGA")=子码流（低清 H.264 640×480）；线上值经固件子串匹配，见 Res 注释
 //   - 每通道共享会话扇出：同通道多个订阅者只占一路 NVR 会话，各自独立下行缓冲
@@ -232,10 +234,11 @@ func (r Res) String() string {
 // Stream: 订阅 NVR API 通道 ch 的实时预览流（读失败内部自动重连）。
 // 注意 ch 是 NVR 协议通道号（0 起）；HTTP 端点的用户通道号（1 起）已在 main.go 换算。
 // 同一 (通道, 档位, clean) 的多个订阅者共享一路 NVR 会话：上游只拉一次，
-// 清洗（如果需要）在 hub 侧只做一遍，再扇出给所有订阅者（各自独立下行缓冲，
+// 重封装在 hub 侧只做一遍，再扇出给所有订阅者（各自独立下行缓冲，
 // 满则丢最旧，只影响自己）。
-// clean=true 时 hub 统一做 TS 清洗（剔除 TP-Link 私有流，只留视频流），
-// 所有订阅者拿到同一份清洗后的流；clean=false 原样透传 NVR 原始流。
+// hub 统一把 TP-Link 私有音频流(0x92 WAVE/A-law)重封装成标准 PCMA(0x90)，
+// 所有订阅者拿到同一份带音频的流。clean=true 额外丢掉 null/未知 PID；
+// clean=false 时未知 PID 仍透传。
 // 返回的 io.ReadCloser 由调用方负责 Close。
 func (c *Client) Stream(ch int, res Res, clean bool) io.ReadCloser {
 	if res == "" {
@@ -246,9 +249,7 @@ func (c *Client) Stream(ch int, res Res, clean bool) io.ReadCloser {
 	h := c.hubs[key]
 	if h == nil {
 		h = &hub{ch: ch, res: res, clean: clean, c: c, subs: map[*sub]struct{}{}, wake: make(chan struct{}, 1)}
-		if clean {
-			h.cleaner = newTSCleaner()
-		}
+		h.remuxer = newTSRemuxer(clean)
 		c.hubs[key] = h
 		go h.run()
 	}
@@ -256,7 +257,7 @@ func (c *Client) Stream(ch int, res Res, clean bool) io.ReadCloser {
 	return h.subscribe()
 }
 
-// hubKey: 通道、码流档位与会话形态（清洗与否）一起作为共享上游的键：
+// hubKey: 通道、码流档位与会话形态（clean 与否）一起作为共享上游的键：
 // 不同档位/不同清洗形态的订阅者各自一条上游，互不干扰。
 type hubKey struct {
 	ch    int
@@ -267,13 +268,13 @@ type hubKey struct {
 // hub: 一个 (通道, 档位, 清洗形态) 的共享上游。多个 HTTP 客户端订阅同一 key 时，
 // 只维持一路 NVR preview 会话，hub 把流扇出给所有订阅者；hub 与上游循环
 // 常驻进程生命周期，无订阅者时待命（不占 NVR 会话）。
-// clean 形态下清洗在 hub 做一遍（cleaner 常驻，学习到的 PID 跨会话保留），
-// 订阅者拿到的是同一份已清洗的流。
+// 重封装在 hub 做一遍（remuxer 常驻，学习到的 PID 跨会话保留），
+// 订阅者拿到的是同一份带标准 PCMA 音频的流。
 type hub struct {
 	ch      int
 	res     Res
 	clean   bool
-	cleaner *tsCleaner // clean 时非空：feed 前先清洗一次
+	remuxer *tsRemuxer // 常驻：feed 前把私有音频重封装成标准 PCMA
 	c       *Client
 	mu      sync.Mutex
 	subs    map[*sub]struct{}
@@ -391,13 +392,10 @@ func (h *hub) consume(cn *nvrConn) error {
 	}
 }
 
-// feed: 上游的一个 video part → 先（按需）清洗一次，再扇出给所有订阅者。
-// clean 形态下清洗只做一遍：所有订阅者共享同一份输出，
-// 避免 N 个订阅者对同一份原始流重复清洗。
+// feed: 上游的一个 video part → 重封装一次（私有音频→PCMA），再扇出给所有订阅者。
+// 重封装只做一遍：所有订阅者共享同一份输出，避免 N 个订阅者重复处理。
 func (h *hub) feed(part []byte) {
-	if h.clean {
-		part = h.cleaner.feed(part)
-	}
+	part = h.remuxer.feed(part)
 	h.broadcast(part)
 }
 
